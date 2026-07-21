@@ -10,6 +10,8 @@ const {
     SPOTIFY_CLIENT_ID,
     SPOTIFY_CLIENT_SECRET,
     SPOTIFY_REFRESH_TOKEN,
+    RENDER_API_KEY,
+    RENDER_SERVICE_ID,
 } = process.env;
 
 if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !APP_BASE_URL) {
@@ -22,6 +24,25 @@ const app = express();
 const SCOPES = ["user-read-currently-playing", "user-read-playback-state"].join(" ");
 const COVER_CACHE_TTL_MS = 10 * 60 * 1000;
 const coverCache = new Map();
+let spotifyRefreshToken = SPOTIFY_REFRESH_TOKEN;
+let accessTokenCache = null;
+let accessTokenPromise = null;
+
+function parseCookies(req) {
+    return Object.fromEntries(
+        String(req.headers.cookie || "")
+            .split(";")
+            .map(part => part.trim().split(/=(.*)/s))
+            .filter(([key]) => key)
+            .map(([key, value]) => [key, decodeURIComponent(value || "")])
+    );
+}
+
+function safeEqual(a, b) {
+    const left = Buffer.from(String(a || ""));
+    const right = Buffer.from(String(b || ""));
+    return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
 
 function toBasicAuth(id, secret) {
     return Buffer.from(`${id}:${secret}`).toString("base64");
@@ -64,6 +85,70 @@ async function getAccessTokenViaRefreshToken(refreshToken) {
 
     if (!res.ok) throw new Error(`Refresh token failed: ${res.status} ${await res.text()}`);
     return res.json();
+}
+
+async function renderApi(path, options = {}) {
+    if (!RENDER_API_KEY || !RENDER_SERVICE_ID) {
+        throw new Error("Missing RENDER_API_KEY or RENDER_SERVICE_ID");
+    }
+
+    const res = await fetch(`https://api.render.com/v1/services/${encodeURIComponent(RENDER_SERVICE_ID)}${path}`, {
+        ...options,
+        headers: {
+            Authorization: `Bearer ${RENDER_API_KEY}`,
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            ...options.headers,
+        },
+    });
+
+    if (!res.ok) {
+        throw new Error(`Render API failed: ${res.status} ${await res.text()}`);
+    }
+    return res.status === 204 ? null : res.json();
+}
+
+async function saveRefreshTokenOnRender(refreshToken) {
+    await renderApi("/env-vars/SPOTIFY_REFRESH_TOKEN", {
+        method: "PUT",
+        body: JSON.stringify({ value: refreshToken }),
+    });
+    await renderApi("/deploys", {
+        method: "POST",
+        body: JSON.stringify({ clearCache: "do_not_clear" }),
+    });
+}
+
+async function getSpotifyAccessToken() {
+    if (accessTokenCache && Date.now() < accessTokenCache.expiresAt) {
+        return accessTokenCache.value;
+    }
+    if (accessTokenPromise) return accessTokenPromise;
+
+    accessTokenPromise = (async () => {
+        if (!spotifyRefreshToken) {
+            throw new Error("Spotify authorization required. Visit /login.");
+        }
+
+        const tokens = await getAccessTokenViaRefreshToken(spotifyRefreshToken);
+        if (tokens.refresh_token && tokens.refresh_token !== spotifyRefreshToken) {
+            spotifyRefreshToken = tokens.refresh_token;
+            await saveRefreshTokenOnRender(spotifyRefreshToken);
+        }
+
+        accessTokenCache = {
+            value: tokens.access_token,
+            // Refresh a minute early to avoid using a token near expiration.
+            expiresAt: Date.now() + Math.max(60, (tokens.expires_in || 3600) - 60) * 1000,
+        };
+        return accessTokenCache.value;
+    })();
+
+    try {
+        return await accessTokenPromise;
+    } finally {
+        accessTokenPromise = null;
+    }
 }
 
 async function fetchCurrentlyPlaying(accessToken) {
@@ -129,11 +214,7 @@ async function urlToDataUri(url) {
 }
 
 async function getNowPlayingPayload() {
-    if (!SPOTIFY_REFRESH_TOKEN) {
-        return { error: "Missing SPOTIFY_REFRESH_TOKEN. Hit /login and set it in .env." };
-    }
-
-    const { access_token } = await getAccessTokenViaRefreshToken(SPOTIFY_REFRESH_TOKEN);
+    const access_token = await getSpotifyAccessToken();
     const data = await fetchCurrentlyPlaying(access_token);
 
     if (!data || !data.item) return { isPlaying: false };
@@ -317,24 +398,51 @@ function renderSVG(opts) {
 }
 
 app.get("/login", (req, res) => {
+    const state = crypto.randomBytes(32).toString("base64url");
+    const secureCookie = APP_BASE_URL.startsWith("https://") ? "; Secure" : "";
     const params = new URLSearchParams({
         client_id: SPOTIFY_CLIENT_ID,
         response_type: "code",
         redirect_uri: `${APP_BASE_URL}/callback`,
         scope: SCOPES,
+        state,
     });
+    res.setHeader(
+        "Set-Cookie",
+        `spotify_oauth_state=${encodeURIComponent(state)}; HttpOnly${secureCookie}; SameSite=Lax; Path=/callback; Max-Age=600`
+    );
     res.redirect(`https://accounts.spotify.com/authorize?${params.toString()}`);
 });
 
 app.get("/callback", async (req, res) => {
     try {
+        const secureCookie = APP_BASE_URL.startsWith("https://") ? "; Secure" : "";
+        const expectedState = parseCookies(req).spotify_oauth_state;
+        if (!expectedState || !safeEqual(req.query.state, expectedState)) {
+            return res.status(400).send("Invalid or expired OAuth state. Start again at /login.");
+        }
+        res.setHeader(
+            "Set-Cookie",
+            `spotify_oauth_state=; HttpOnly${secureCookie}; SameSite=Lax; Path=/callback; Max-Age=0`
+        );
+
+        if (req.query.error) return res.status(400).send(`Spotify authorization failed: ${esc(req.query.error)}`);
         const code = req.query.code;
         if (!code) return res.status(400).send("Missing ?code");
         const tokens = await exchangeCodeForTokens(code);
         const refresh = tokens.refresh_token;
         if (!refresh) return res.status(500).send("No refresh_token returned. Check scopes.");
-        res.send(`<h2>Copy your Refresh Token</h2><pre>${refresh}</pre>`);
+        spotifyRefreshToken = refresh;
+        accessTokenCache = tokens.access_token
+            ? {
+                value: tokens.access_token,
+                expiresAt: Date.now() + Math.max(60, (tokens.expires_in || 3600) - 60) * 1000,
+            }
+            : null;
+        await saveRefreshTokenOnRender(refresh);
+        res.send("<h2>Spotify reauthorized</h2><p>The refresh token was saved to Render and a deploy was started. You can close this page.</p>");
     } catch (e) {
+        console.error("Spotify callback failed:", e);
         res.status(500).send(String(e));
     }
 });
