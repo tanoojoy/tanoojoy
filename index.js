@@ -1,6 +1,7 @@
 const express = require("express");
 const dotenv = require("dotenv");
 const crypto = require("crypto");
+const sharp = require("sharp");
 
 dotenv.config();
 
@@ -23,6 +24,7 @@ const app = express();
 
 const SCOPES = ["user-read-currently-playing", "user-read-playback-state"].join(" ");
 const COVER_CACHE_TTL_MS = 10 * 60 * 1000;
+const FALLBACK_IMAGE_URL = "https://raw.githubusercontent.com/tanoojoy/tanoojoy/refs/heads/main/sleepybara.png";
 const coverCache = new Map();
 let spotifyRefreshToken = SPOTIFY_REFRESH_TOKEN;
 let accessTokenCache = null;
@@ -193,9 +195,7 @@ function cacheSet(url, dataUri) {
 }
 
 async function urlToDataUri(url) {
-    if (!url) {
-        return "https://raw.githubusercontent.com/tanoojoy/tanoojoy/refs/heads/main/sleepybara.png";
-    }
+    url ||= FALLBACK_IMAGE_URL;
     const cached = cacheGet(url);
     if (cached) return cached;
 
@@ -203,9 +203,12 @@ async function urlToDataUri(url) {
         const res = await fetch(url);
         if (!res.ok) throw new Error(`image fetch ${res.status}`);
         const buf = Buffer.from(await res.arrayBuffer());
-        const contentType = res.headers.get("content-type") || "image/jpeg";
-        const base64 = buf.toString("base64");
-        const dataUri = `data:${contentType};base64,${base64}`;
+        const compactImage = await sharp(buf, { limitInputPixels: 25_000_000 })
+            .rotate()
+            .resize(320, 320, { fit: "cover" })
+            .jpeg({ quality: 72 })
+            .toBuffer();
+        const dataUri = `data:image/jpeg;base64,${compactImage.toString("base64")}`;
         cacheSet(url, dataUri);
         return dataUri;
     } catch {
@@ -471,7 +474,7 @@ app.get("/now-playing.svg", async (req, res) => {
                 ...payload,
                 title: "Not using Spotify",
                 album: "*cricket noises*",
-                imageUrl: await urlToDataUri("https://raw.githubusercontent.com/tanoojoy/tanoojoy/refs/heads/main/sleepybara.png"),
+                imageUrl: await urlToDataUri(FALLBACK_IMAGE_URL),
                 progressMs: 0,
                 durationMs: 0,
                 remainingMs: 0,

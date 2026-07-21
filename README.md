@@ -1,6 +1,6 @@
 ### 🎧 Now Playing on Spotify
 
-![Now Playing](https://real-time-alert.onrender.com/now-playing.svg)
+![Now Playing](https://real-time-alert.onrender.com/now-playing.svg?v=2)
 
 ###  My coding activity
 
